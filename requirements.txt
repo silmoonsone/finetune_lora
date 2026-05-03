@@ -1,0 +1,11 @@
+# Qwen3.5（model_type=qwen3_5）：当前 PyPI 正式版可能仍无法加载权重，需：
+#   Python >= 3.10
+#   pip install git+https://github.com/huggingface/transformers.git
+# 多模态推理若用 AutoProcessor，另需: pip install pillow
+torch>=2.5.0
+transformers>=4.57.0
+accelerate>=1.0.0
+peft>=0.14.0
+trl>=0.20.0
+datasets>=3.0.0
+safetensors>=0.4.0
