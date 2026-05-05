@@ -23,6 +23,38 @@ def _die(msg: str, code: int = 2) -> None:
     raise SystemExit(code)
 
 
+def _is_lora_output_dir(path: Path) -> bool:
+    # 常见 LoRA 保存产物；满足核心文件即可视为“可二次微调”的目录。
+    names = {p.name for p in path.iterdir()}
+    has_adapter_cfg = "adapter_config.json" in names
+    has_adapter_weights = any(
+        n in names for n in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+    return has_adapter_cfg and has_adapter_weights
+
+
+def _confirm_continue_from_lora_output(path: Path) -> None:
+    print(
+        "检测到输出目录中已存在 LoRA 微调产物：\n"
+        f"  {path}\n"
+        "你想怎么做？\n"
+        "  [y] 继续（对已有目录执行二次微调并写入新结果）\n"
+        "  [n] 终止",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            ans = input("请输入 y 或 n: ").strip().lower()
+        except EOFError:
+            _die("错误：未读取到确认输入，已终止以避免覆盖现有产物。")
+        if ans in {"y", "yes"}:
+            print("已确认继续：将进行二次微调。", file=sys.stderr)
+            return
+        if ans in {"n", "no"}:
+            _die("已按用户选择终止。")
+        print("无效输入，请输入 y 或 n。", file=sys.stderr)
+
+
 def _epilog() -> str:
     return """
 必填参数（无内置默认路径）：
@@ -101,6 +133,21 @@ def main() -> None:
     out_parent = output_dir.parent
     if not out_parent.is_dir():
         _die(f"错误：输出目录的父路径不存在：\n  {out_parent}")
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            _die(f"错误：--output 不是目录：\n  {output_dir}")
+        entries = [p for p in output_dir.iterdir()]
+        if entries:
+            if _is_lora_output_dir(output_dir):
+                _confirm_continue_from_lora_output(output_dir)
+            else:
+                preview = ", ".join(sorted(p.name for p in entries)[:10])
+                more = "" if len(entries) <= 10 else " ..."
+                _die(
+                    "错误：输出目录中存在非 LoRA 产物文件，已终止以避免写入到混杂目录。\n"
+                    f"目录：{output_dir}\n"
+                    f"内容预览：{preview}{more}"
+                )
 
     for flag, val, pred, hint in (
         ("--epochs", args.epochs, lambda x: x > 0, "须为正数"),

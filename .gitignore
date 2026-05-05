@@ -5,6 +5,7 @@
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+*.local.*
 
 # 项目大目录（仅仓库根目录）
 /models/

@@ -1,6 +1,9 @@
-# 本地 Qwen3.5：对话 · LoRA 微调 · 导出 GGUF
+# 本地大模型：对话 · LoRA 监督微调 · 导出 GGUF
 
-本仓库三个脚本，典型顺序是：**在本机 Python 里装好依赖 → 放基座模型 →（可选）先聊基座 → 准备数据 → LoRA 微调 → 用 LoRA 再聊 →（可选）导出 GGUF**。  
+本仓库是一套面向 **Hugging Face 格式**基座模型的本地工作流：**终端多轮对话**、**JSONL 的 LoRA 监督微调（SFT）**、**可选合并并借助 llama.cpp 导出 GGUF**。  
+**不限定于 Qwen**：只要本机 `transformers` 能加载你的基座，且 tokenizer 提供可用的对话模板，即可按同样步骤使用；下文路径、命令与排障仍以 **Qwen3.5** 为主（作者主要在该系列上验证）。
+
+三个脚本的典型顺序是：**在本机 Python 里装好依赖 → 放基座模型 →（可选）先聊基座 → 准备数据 → LoRA 微调 → 用 LoRA 再聊 →（可选）导出 GGUF**。  
 不强制使用虚拟环境；用系统 Python、conda、pyenv 等均可，只要 **`pip install` 与 `python` 属于同一套环境**（避免装包和跑脚本用了两个不同解释器）。
 
 | 脚本 | 作用 |
@@ -43,7 +46,7 @@
 | **bitsandbytes** | 仅在 **CUDA** 上使用本仓库的 **`--4bit`**（QLoRA / 4bit 推理）时 |
 | **pillow** | 若以后用多模态 `AutoProcessor` 做图像输入时（当前终端对话脚本以文本为主） |
 
-**Qwen3.5 与 `transformers`：** `model_type=qwen3_5` 需较新的实现。若 `pip install -r requirements.txt` 后仍报「无法识别模型类型」，请：
+**较新架构与 `transformers`（以 Qwen3.5 为例）：** `model_type=qwen3_5` 需较新的实现。其它基座若报「无法识别模型类型」，亦可尝试同类处理。若 `pip install -r requirements.txt` 后仍无法加载，请：
 
 1. 确认 Python **≥3.10**；
 2. 按 `requirements.txt` 文件顶部注释，尝试从源码安装最新版，例如：  
@@ -99,12 +102,12 @@ python -m pip install -r requirements.txt
 
 ### 4）准备基座模型（HF 目录）
 
-将 **Hugging Face 格式**的 Qwen3.5（或其它兼容模型）放在本机**任意目录**，模型根目录下必须有 **`config.json`**。**`--model` 请始终改为你自己的基座模型路径**，不必放在本仓库内，也不必叫 `models`。
+将 **Hugging Face 格式**的基座模型（如 Qwen、Llama 系列等，以你本机 `transformers` 支持为准）放在本机**任意目录**，模型根目录下必须有 **`config.json`**。**`--model` 请始终改为你自己的基座模型路径**，不必放在本仓库内，也不必叫 `models`。
 
-目录结构示例（路径与文件夹名均可自定）：
+目录结构示例（路径与文件夹名均可自定；以下为示例名）：
 
 ```text
-/你的/大模型/目录/Qwen3.5-2B/
+/你的/大模型/目录/Your-HF-Model/
   config.json
   ...
 ```
@@ -211,6 +214,8 @@ python chat_finetune.py \
 
 ## 六、对话常用可选项（追加在 `chat_finetune.py` 命令末尾）
 
+`--thinking` 按 **Qwen3.5 类** chat 模板中的思考开关实现；其它基座若模板不同，行为以该模型的 tokenizer 为准。
+
 | 参数 | 含义 |
 |------|------|
 | `--thinking on` | 模板启用思考链；`off` 为直接答 |
@@ -224,7 +229,7 @@ python chat_finetune.py \
 
 ## 七、导出 GGUF（可选）
 
-需本机已 clone **[llama.cpp](https://github.com/ggerganov/llama.cpp)**，并在其仓库根目录执行过 **`pip install -r requirements.txt`**。Qwen3.5 需较新的 llama.cpp。
+需本机已 clone **[llama.cpp](https://github.com/ggerganov/llama.cpp)**，并在其仓库根目录执行过 **`pip install -r requirements.txt`**。新架构模型通常需要较新的 llama.cpp；能否转换以该仓库的 convert 脚本与文档为准（作者以 Qwen3.5 等为例验证过流程）。
 
 **仅基座：**
 
@@ -232,7 +237,7 @@ python chat_finetune.py \
 python export_gguf.py \
   --model /path/to/your/hf-model \
   --llama-cpp /path/to/llama.cpp \
-  --gguf-out /path/to/your/exports/qwen35.f16.gguf \
+  --gguf-out /path/to/your/exports/base.f16.gguf \
   --outtype f16
 ```
 
@@ -244,7 +249,7 @@ python export_gguf.py \
   --lora /path/to/your/lora-output \
   --merged-dir /path/to/your/exports/merged-hf \
   --llama-cpp /path/to/llama.cpp \
-  --gguf-out /path/to/your/exports/qwen35-lora.f16.gguf \
+  --gguf-out /path/to/your/exports/merged-lora.f16.gguf \
   --outtype f16
 ```
 
@@ -278,7 +283,7 @@ python export_gguf.py -h
 
 | 现象 | 方向 |
 |------|------|
-| 无法识别 `qwen3_5` | 升级 Python / `transformers`（见第二节） |
+| 无法识别某 `model_type`（如 `qwen3_5`） | 升级 Python / `transformers`（见第二节）；换基座时同理 |
 | Mac 训练 loss / grad NaN | 已倾向 fp32；可调小学习率或增大 `--grad-accum` |
 | 转 GGUF 报架构不支持 | 升级 llama.cpp 后再试 |
 | 提示输出目录父路径不存在 | 对你 `--output`（或导出相关路径）的**父目录**执行 `mkdir -p` |
