@@ -1,290 +1,181 @@
-# 本地大模型：对话 · LoRA 监督微调 · 导出 GGUF
+# 本地大模型 LoRA 微调
 
-本仓库是一套面向 **Hugging Face 格式**基座模型的本地工作流：**终端多轮对话**、**JSONL 的 LoRA 监督微调（SFT）**、**可选合并并借助 llama.cpp 导出 GGUF**。  
-**不限定于 Qwen**：只要本机 `transformers` 能加载你的基座，且 tokenizer 提供可用的对话模板，即可按同样步骤使用；下文路径、命令与排障仍以 **Qwen3.5** 为主（作者主要在该系列上验证）。
+这个仓库主要做三件事：
 
-三个脚本的典型顺序是：**在本机 Python 里装好依赖 → 放基座模型 →（可选）先聊基座 → 准备数据 → LoRA 微调 → 用 LoRA 再聊 →（可选）导出 GGUF**。  
-不强制使用虚拟环境；用系统 Python、conda、pyenv 等均可，只要 **`pip install` 与 `python` 属于同一套环境**（避免装包和跑脚本用了两个不同解释器）。
+- `chat_finetune.py`：加载基座模型聊天。
+- `finetune_lora.py`：加载基座模型做 LoRA 微调。
+- `chat_lora.py`：加载基座模型 + LoRA 聊天。
+- `export_gguf.py`：可选，把基座或合并 LoRA 后的模型导出为 GGUF。
 
-| 脚本 | 作用 |
-|------|------|
-| `chat_finetune.py` | 终端多轮对话（基座 ± LoRA） |
-| `finetune_lora.py` | 用 JSONL 做 LoRA 监督微调（SFT） |
-| `export_gguf.py` | 合并 LoRA 并调用本机 **llama.cpp** 转成 `.gguf` |
+下文命令默认从仓库根目录执行。脚本会自动读取仓库根目录的 `config.json`。
 
 ---
 
-## 一、环境需求（先对照再装）
+## 快速开始
 
-| 项目 | 说明 |
-|------|------|
-| **操作系统** | macOS / Linux / Windows 均可；有 **NVIDIA GPU** 可用 CUDA 加速训练与推理 |
-| **Python** | **建议 3.10～3.12**（过旧可能装不上新版 `torch`/`transformers`；其它版本以本机 `pip` 能否装上 `requirements.txt` 为准）。用系统自带、`conda`、`pyenv` 或下节可选的 **venv** 均可，无强制要求 |
-| **磁盘** | 基座模型体积大（如 2B/9B），另预留空间给 LoRA 输出与可选 GGUF |
-| **内存 / 显存** | Mac 上常用 **MPS + CPU 内存**；显式训练参数见下文，可按机器把 `--batch`、`--max-seq-len` 调小 |
-
----
-
-## 二、依赖包、版本与用途
-
-以下与仓库根目录 **`requirements.txt`** 一致（安装时用该文件即可）。
-
-| 包 | 版本约束（摘录） | 用途 |
-|----|------------------|------|
-| **torch** | `>=2.5.0` | 张量计算、CUDA/MPS、模型加载 |
-| **transformers** | `>=4.57.0` | 加载 HF 模型与 tokenizer、chat 模板 |
-| **accelerate** | `>=1.0.0` | 分布式/设备映射（训练常用） |
-| **peft** | `>=0.14.0` | LoRA 适配器加载、合并 |
-| **trl** | `>=0.20.0` | `SFTTrainer` 做监督微调 |
-| **datasets** | `>=3.0.0` | 将 JSONL 转为训练用 `Dataset` |
-| **safetensors** | `>=0.4.0` | 安全加载权重 |
-
-**可选（未写入 `requirements.txt`，按需自行安装）：**
-
-| 包 | 何时需要 |
-|----|-----------|
-| **bitsandbytes** | 仅在 **CUDA** 上使用本仓库的 **`--4bit`**（QLoRA / 4bit 推理）时 |
-| **pillow** | 若以后用多模态 `AutoProcessor` 做图像输入时（当前终端对话脚本以文本为主） |
-
-**较新架构与 `transformers`（以 Qwen3.5 为例）：** `model_type=qwen3_5` 需较新的实现。其它基座若报「无法识别模型类型」，亦可尝试同类处理。若 `pip install -r requirements.txt` 后仍无法加载，请：
-
-1. 确认 Python **≥3.10**；
-2. 按 `requirements.txt` 文件顶部注释，尝试从源码安装最新版，例如：  
-   `pip install -U git+https://github.com/huggingface/transformers.git`
-
----
-
-## 三、Python 准备与依赖安装（不强制虚拟环境）
-
-**仓库根目录**：包含 `requirements.txt`、`chat_finetune.py` 等的目录（本仓库克隆后一般为 `finetune_lora`，路径随你本机存放位置而定）。**下文所有命令均假定你已在该目录打开终端**，无需再 `cd` 到其它占位路径。`python3` / `python` 请改成你实际用的命令（Windows 上可能是 `py -3.12` 等）。
-
-### 1）要准备什么样的 Python
-
-- **版本**：优先 **Python 3.10～3.12**（与「一、环境需求」一致）。
-- **环境**：全局、conda、pyenv 等任意；关键是 **`pip` 与 `python` 成对**（同一前缀，避免「pip 装到 A，python 却是 B」）。
-
-### 2）一次性安装 / 按清单「恢复」所有依赖
-
-仓库根目录的 **`requirements.txt`** 既是**首次安装清单**，也是换机器、换目录时**按同样版本约束重装（恢复）依赖**的依据。
-
-在仓库根目录执行（任选一种习惯写法）：
+安装依赖：
 
 ```bash
 python3 -m pip install -U pip
 python3 -m pip install -r requirements.txt
 ```
 
-含义简述：
+确认或修改 `config.json`。当前配置已经按本机现有路径写好：
 
-| 命令 | 作用 |
-|------|------|
-| `python3 -m pip install -U pip` | 升级 pip，减少解析依赖时的老问题（可选但推荐） |
-| `python3 -m pip install -r requirements.txt` | **按文件里列出的包与版本下限，一次性装全**本仓库脚本所需依赖 |
+- 基座模型：`../../../../Projects/LLMs/models/Qwen3.5-9B`
+- 训练数据：`./data/train_cute.jsonl`
+- LoRA 输出：`../../../../Projects/LLMs/outputs/Qwen3.5-9B`
 
-若 **`torch` 安装失败**，请到 [PyTorch 官网](https://pytorch.org/get-started/locally/) 按系统与 CUDA 选一条官方命令先装好 **torch**，再执行一次 `pip install -r requirements.txt`（其余包会继续补齐）。
-
-### 3）（可选）想用虚拟环境隔离时
-
-若你希望与系统包分开，可自建 venv，**仍在该 venv 里执行上一小节的 `pip install -r requirements.txt`** 即可：
+然后直接运行三步：
 
 ```bash
-python3 -m venv .venv
-# macOS / Linux:
-source .venv/bin/activate
-# Windows cmd:  .venv\Scripts\activate.bat
-# Windows PowerShell:  .venv\Scripts\Activate.ps1
-
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+python3 chat_finetune.py
 ```
-
-之后运行脚本前，**记得先激活**同一 venv（或始终使用 `./.venv/bin/python` 全路径调用）。
-
-### 4）准备基座模型（HF 目录）
-
-将 **Hugging Face 格式**的基座模型（如 Qwen、Llama 系列等，以你本机 `transformers` 支持为准）放在本机**任意目录**，模型根目录下必须有 **`config.json`**。**`--model` 请始终改为你自己的基座模型路径**，不必放在本仓库内，也不必叫 `models`。
-
-目录结构示例（路径与文件夹名均可自定；以下为示例名）：
-
-```text
-/你的/大模型/目录/Your-HF-Model/
-  config.json
-  ...
-```
-
-模型可从 [Hugging Face Hub](https://huggingface.co/) 用 `huggingface-cli download` 或网页下载后解压；下文命令里的 `--model` 指向上述「含 `config.json` 的那一层」即可。
-
-### 5）微调前：创建输出父目录（按需）
-
-微调脚本的 **`--output`** 的**父目录必须已存在**。**`--output` 请改为你希望保存 LoRA 的目录**（任意本机路径均可），例如你希望写到 `/你的/训练输出/lora-run1`，则先：
 
 ```bash
-mkdir -p /path/to/parent-of-your-lora-output
+python3 finetune_lora.py
 ```
 
-（把该路径换成你 `--output` 所选目录的**父目录**。）
+```bash
+python3 chat_lora.py
+```
 
-**下文所有示例**里的 `python` 均表示：**你已选定的、且已执行过 `pip install -r requirements.txt` 的那个解释器**（若用 conda，请先 `conda activate` 到你的环境）。
+也可以指定另一个配置文件：
 
-**示例中的路径**：`/path/to/your/hf-model`、`/path/to/your/lora-output`、`/path/to/your/exports` 等均为占位符，请一律替换为你本机实际目录。
+```bash
+python3 chat_finetune.py --config ./config.json
+python3 finetune_lora.py --config ./config.json
+python3 chat_lora.py --config ./config.json
+```
+
+脚本启动时会打印实际使用的配置文件、profile、基座模型、微调文件和输出目录。
+
+`finetune_lora.py` 会自动判断输出目录：
+
+- 输出目录不存在或为空：新建 LoRA 并训练。
+- 输出目录已有 LoRA：询问是否在已有 LoRA 上继续微调，输入 `y` 才会继续。
+- 输出目录有非 LoRA 文件：停止，避免写乱目录。
 
 ---
 
-## 四、完整流程：基座聊天 → 微调 → 微调后再聊天
+## config.json
 
-按顺序执行即可；若你**只做推理、不训练**，可只做 **A**，跳过 **B**。
+三个常用行为都在同一个 `config.json` 里。通常只需要先改 `paths`：
 
-### A. 启动聊天（仅基座，无 LoRA）
+- `paths.model`：基座模型目录。
+- `paths.data`：训练 JSONL。
+- `paths.lora_output`：LoRA 输出目录，也是 LoRA 聊天加载的目录。
 
-确认已：**第三节**里装好依赖，并已放好 **基座模型目录**。
+公共参数写在 `defaults`，profile 里可以用 `${paths.xxx}` 复用路径，避免同一个路径写好几遍：
 
-```bash
-python chat_finetune.py \
-  --model /path/to/your/hf-model \
-  --device auto \
-  --thinking off \
-  --max-new-tokens 512 \
-  --temperature 0.7 \
-  --top-p 0.9
-```
+- `profiles.base_chat`：基座聊天参数。
+- `profiles.finetune`：微调路径与训练参数。
+- `profiles.lora_chat`：基座 + LoRA 聊天参数。
 
-运行后出现提示即可输入用户消息。**`/reset`** 清空历史；**`/quit`** 或 **Ctrl+D** 退出。
+常改项：
 
-**一般只需改：** `--model` 指向你本机 Hugging Face 格式基座模型目录（任意路径）；必要时改 `--device`（`cuda` / `mps` / `cpu` / `auto`）。
-
----
-
-### B. 启动微调（LoRA SFT）
-
-确认已：**第三节**（含依赖与模型）、**第 5 步**若需要则已 `mkdir`、并已准备 **`data/*.jsonl`**（格式见第五节）。
-
-```bash
-python finetune_lora.py \
-  --model /path/to/your/hf-model \
-  --data ./data/train_cute.jsonl \
-  --output /path/to/your/lora-output \
-  --epochs 3 \
-  --learning-rate 1e-4 \
-  --batch 1 \
-  --grad-accum 8 \
-  --max-seq-len 2048 \
-  --lora-r 16 \
-  --lora-alpha 32
-```
-
-**说明：**
-
-- 非 CUDA（如 Apple **MPS**）时基座会以 **fp32** 训练，更稳但更慢。
-- 仅 **NVIDIA + CUDA** 可在命令末尾追加 **`--4bit`**（需已安装 **bitsandbytes**）。
+| 配置项 | 作用 | 建议 |
+|------|------|------|
+| `model` | Hugging Face 基座模型目录 | 必须包含 `config.json` |
+| `data` | 训练 JSONL | 默认 `./data/train_cute.jsonl` |
+| `output` | LoRA 输出目录 | 父目录必须存在 |
+| `lora` | 聊天时加载的 LoRA 目录 | 指向微调输出目录 |
+| `thinking` | Qwen3.5 思考开关 | 普通聊天常用 `off` |
+| `max_new_tokens` | 每轮最多生成 token 数 | 常用 `512` |
+| `temperature` / `top_p` | 采样参数 | 常用 `0.7` / `0.9` |
 
 ---
 
-### C. 启动微调后的聊天（基座 + LoRA）
+## 训练参数
 
-微调结束后，`--output` 目录内会有 **`adapter_config.json`** 等文件。用同一基座路径，并加上 **`--lora`**：
+| 配置项 | 作用 | 建议 |
+|------|------|------|
+| `epochs` | 训练轮数 | 小数据集先试 `1` 到 `3` |
+| `learning_rate` | 学习率 | 常用 `0.0001` 或 `0.00005`；不稳就调小 |
+| `batch` | 每步样本数 | 显存不够就用 `1` |
+| `grad_accum` | 梯度累积 | 等效 batch 约为 `batch * grad_accum` |
+| `max_seq_len` | 最大 token 长度 | 显存吃紧可降到 `1024` |
+| `lora_r` | LoRA rank | 常用 `8`、`16`、`32` |
+| `lora_alpha` | LoRA 缩放 | 常用 `2 * r`，例如 `r=16` 时 `32` |
+| `use_4bit` | CUDA 上 4bit 加载 | 仅 NVIDIA CUDA，需要 `bitsandbytes` |
 
-```bash
-python chat_finetune.py \
-  --model /path/to/your/hf-model \
-  --lora /path/to/your/lora-output \
-  --device auto \
-  --thinking off \
-  --max-new-tokens 512 \
-  --temperature 0.7 \
-  --top-p 0.9
-```
-
-**一般只需改：** `--model`（基座目录）、`--lora`（与训练时 `--output` 一致，为你自选的 LoRA 输出目录）。
-
-**Mac + LoRA + MPS：** 脚本会对 LoRA 推理使用 **fp32**，减轻部分 fp16 下的数值问题。
+继续微调已有 LoRA 时，会沿用原 LoRA 结构，`lora_r` 和 `lora_alpha` 不会重新改变已有结构。
 
 ---
 
-## 五、数据格式（`finetune_lora.py`）
+## 数据格式
 
-每行一个 JSON 对象，**必须**含 `messages` 数组（`role` / `content`）。可含 `system`。
+训练数据是 JSONL，每行一个对象，必须包含 `messages`：
 
 ```json
 {"messages":[{"role":"user","content":"你好"},{"role":"assistant","content":"你好！"}]}
 ```
 
-示例文件：`data/train_cute.jsonl`。
+示例文件在 `data/train_cute.jsonl`。
 
 ---
 
-## 六、对话常用可选项（追加在 `chat_finetune.py` 命令末尾）
+## 导出 GGUF（可选）
 
-`--thinking` 按 **Qwen3.5 类** chat 模板中的思考开关实现；其它基座若模板不同，行为以该模型的 tokenizer 为准。
+这一步只在需要给 LM Studio 等工具加载 GGUF 时使用。需要本机已有 `llama.cpp`，并在 `llama.cpp` 里装过它自己的 requirements。
 
-| 参数 | 含义 |
-|------|------|
-| `--thinking on` | 模板启用思考链；`off` 为直接答 |
-| `--system '你是助手…'` | 首轮前注入系统提示；`/reset` 后会再次注入 |
-| `--greedy` | 贪心解码；温度仍可写 `0`，`--top-p 1` |
-| `--no-stream` | 非流式，整段打完再显示 |
-| `--device cuda` / `mps` / `cpu` | 固定设备 |
-| `--4bit` | 仅 CUDA：4bit 加载基座 |
-
----
-
-## 七、导出 GGUF（可选）
-
-需本机已 clone **[llama.cpp](https://github.com/ggerganov/llama.cpp)**，并在其仓库根目录执行过 **`pip install -r requirements.txt`**。新架构模型通常需要较新的 llama.cpp；能否转换以该仓库的 convert 脚本与文档为准（作者以 Qwen3.5 等为例验证过流程）。
-
-**仅基座：**
+导出基座：
 
 ```bash
-python export_gguf.py \
-  --model /path/to/your/hf-model \
-  --llama-cpp /path/to/llama.cpp \
-  --gguf-out /path/to/your/exports/base.f16.gguf \
+python3 export_gguf.py \
+  --model ../../../../Projects/LLMs/models/Qwen3.5-9B \
+  --llama-cpp ../../../../Projects/LLMs/llama.cpp \
+  --gguf-out ../../../../Projects/LLMs/merged/Qwen3.5-9B/Qwen3.5-9B-base-f16.gguf \
   --outtype f16
 ```
 
-**基座 + LoRA**（`--merged-dir` 已存在且非空时需加 **`--overwrite`** 或换目录）：
+导出基座 + LoRA：
 
 ```bash
-python export_gguf.py \
-  --model /path/to/your/hf-model \
-  --lora /path/to/your/lora-output \
-  --merged-dir /path/to/your/exports/merged-hf \
-  --llama-cpp /path/to/llama.cpp \
-  --gguf-out /path/to/your/exports/merged-lora.f16.gguf \
-  --outtype f16
+python3 export_gguf.py \
+  --model ../../../../Projects/LLMs/models/Qwen3.5-9B \
+  --lora ../../../../Projects/LLMs/outputs/Qwen3.5-9B \
+  --merged-dir ../../../../Projects/LLMs/merged/Qwen3.5-9B/hf \
+  --llama-cpp ../../../../Projects/LLMs/llama.cpp \
+  --gguf-out ../../../../Projects/LLMs/merged/Qwen3.5-9B/Qwen3.5-9B-f16.gguf \
+  --outtype f16 \
+  --overwrite
 ```
 
-`--gguf-out`、`--merged-dir` 同样请改为你希望存放导出文件的本机目录（父目录需已存在，必要时先 `mkdir -p`）。
+### 导入 LM Studio
 
----
-
-## 八、查看完整命令行参数
+导出 GGUF 后，可以用 LM Studio 的 `lms` 命令导入。建议用 `--copy` 保留原始 GGUF 文件，避免默认导入时把文件移动到 LM Studio 的模型目录：
 
 ```bash
-python chat_finetune.py -h
-python finetune_lora.py -h
-python export_gguf.py -h
+lms import --copy <path-to-gguf> --user-repo <creator/model-name>
 ```
 
----
+参数说明：
 
-## 九、目录约定（与 `.gitignore`）
+- `--copy`：复制 GGUF 到 LM Studio 模型目录，原文件仍保留在 `merged/` 下。
+- `<path-to-gguf>`：换成你实际导出的 GGUF 文件路径。
+- `<creator/model-name>`：换成你想在 LM Studio UI 中显示的分类名，例如 `silmoon/xiaoming-9b`。
 
-| 路径 | 说明 |
-|------|------|
-| 基座模型 | **无固定仓库子目录**；通过各脚本的 **`--model`** 指向你本机任意 Hugging Face 格式模型目录 |
-| LoRA / 训练输出 | **无固定仓库子目录**；通过 **`--output`** 指向你希望写入的目录（父目录须已存在） |
-| `data/` | 训练用 JSONL，默认可放在仓库内，可入库 |
-
-若你**选择**把大模型或输出放在仓库下的 `models/`、`outputs/` 等文件夹，可与 `.gitignore` 配合避免误提交权重；这不是脚本要求的路径。
+如果不确定分类名，也可以不加 `--user-repo`，运行 `lms import --copy /path/to/model.gguf` 后按提示选择 `Interactive import`，手动填写 creator 和 model name。
 
 ---
 
-## 十、常见问题（极简）
+## 常见问题
 
-| 现象 | 方向 |
+| 问题 | 处理 |
 |------|------|
-| 无法识别某 `model_type`（如 `qwen3_5`） | 升级 Python / `transformers`（见第二节）；换基座时同理 |
-| Mac 训练 loss / grad NaN | 已倾向 fp32；可调小学习率或增大 `--grad-accum` |
-| 转 GGUF 报架构不支持 | 升级 llama.cpp 后再试 |
-| 提示输出目录父路径不存在 | 对你 `--output`（或导出相关路径）的**父目录**执行 `mkdir -p` |
-| 参数报错「必填」 | 路径与多数数值参数须显式写出，缺什么补什么 |
+| 找不到模型或缺少 `config.json` | 检查 `config.json` 里的 `model` 是否指向 Hugging Face 模型根目录 |
+| 输出目录父路径不存在 | 先创建父目录，例如 `mkdir -p ../../../../Projects/LLMs/outputs` |
+| 输出目录已有 LoRA | 输入 `y` 继续微调，输入 `n` 停止 |
+| 无法识别 `qwen3_5` 等模型类型 | 升级 Python 以及 `transformers` / `torch` |
+| Mac 训练 loss 或 grad 出现 NaN | 调小 `learning_rate`，或增大 `grad_accum` |
+| GGUF 转换失败 | 升级 `llama.cpp`，并确认已安装它的依赖 |
+
+查看完整参数：
+
+```bash
+python3 chat_finetune.py -h
+python3 finetune_lora.py -h
+python3 chat_lora.py -h
+python3 export_gguf.py -h
+```

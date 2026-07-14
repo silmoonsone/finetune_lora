@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -66,8 +67,31 @@ def _merge_lora(model_dir: Path, lora_dir: Path, merged_dir: Path, *, overwrite:
         merged = PeftModel.from_pretrained(base, str(lora_dir), is_trainable=False).merge_and_unload()
         merged.save_pretrained(str(merged_dir))
         AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True).save_pretrained(str(merged_dir))
+        _normalize_qwen35_mtp_config(merged_dir)
     except Exception as e:
         _die(f"错误：合并或保存失败：{e}")
+
+
+def _normalize_qwen35_mtp_config(model_dir: Path) -> None:
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _die(f"错误：读取合并后 config.json 失败：{e}")
+
+    text_config = config.get("text_config")
+    if config.get("model_type") != "qwen3_5" or not isinstance(text_config, dict):
+        return
+    if text_config.get("mtp_num_hidden_layers", 0) == 0:
+        return
+
+    text_config["mtp_num_hidden_layers"] = 0
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(
+        "提示：已将合并模型 config.json 中的 text_config.mtp_num_hidden_layers 置为 0，"
+        "避免 GGUF 导出层数多 1 导致 LM Studio 加载失败。",
+        file=sys.stderr,
+    )
 
 
 def main() -> None:

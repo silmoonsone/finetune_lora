@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 本地 Hugging Face 格式多模态/文本模型：终端多轮对话（纯文本模板）。
-支持 Qwen3.5 类 chat 模板中的思考开关（--thinking on|off，对应 enable_thinking）。
+默认读取脚本同目录 config.json 中的 base_chat 配置。
+支持 Qwen3.5 类 chat 模板中的思考开关（thinking on|off，对应 enable_thinking）。
 依赖：torch、transformers、peft（若使用 --lora）。
 """
 
@@ -13,6 +14,7 @@ import threading
 from pathlib import Path
 
 import torch
+from config_utils import apply_config, load_profile, resolve_path
 from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
 
@@ -22,43 +24,17 @@ def _die(msg: str, code: int = 2) -> None:
     raise SystemExit(code)
 
 
-def _epilog() -> str:
-    return """
-除开关外，以下参数均须显式写出（无内置模型路径、无隐式采样超参）：
-  --model --device --thinking --max-new-tokens --temperature --top-p
+def _epilog(default_profile: str, command_name: str) -> str:
+    return f"""
+默认用法：
+  python3 {command_name}
 
-  --thinking 与 Qwen3.5 chat 模板一致：
+脚本会自动读取脚本同目录 config.json 的 profiles.{default_profile}。
+如需改模型路径、生成参数、system prompt，请改 config.json。
+
+thinking 与 Qwen3.5 chat 模板一致：
     on  = 开启「思考」：生成前保留 <think> 块，由模型先推理再答
     off = 关闭：模板使用空思考占位，模型直接作答（常见对话默认）
-
-常用示例（路径请换成你的本机路径）：
-  仅基座 + 采样 + 不思考：
-    python chat_finetune.py \\
-      --model ./models/Qwen3.5-2B --device auto --thinking off \\
-      --max-new-tokens 512 --temperature 0.7 --top-p 0.9
-
-  开启思考链：
-    python chat_finetune.py \\
-      --model ./models/Qwen3.5-2B --device auto --thinking on \\
-      --max-new-tokens 1024 --temperature 0.7 --top-p 0.9
-
-  基座 + LoRA：
-    python chat_finetune.py \\
-      --model ./models/Qwen3.5-2B --lora ./outputs/lora-cute \\
-      --device auto --thinking off \\
-      --max-new-tokens 512 --temperature 0.7 --top-p 0.9
-
-  关闭流式、贪心：
-    python chat_finetune.py \\
-      --model ./models/Qwen3.5-2B --device mps --thinking off \\
-      --max-new-tokens 256 --temperature 0 --top-p 1 --greedy --no-stream
-
-  带 system：
-    python chat_finetune.py \\
-      --model ./models/Qwen3.5-2B --lora ./outputs/lora-cute \\
-      --device auto --thinking off \\
-      --max-new-tokens 512 --temperature 0.7 --top-p 0.9 \\
-      --system '你是小萌…'
 
 对话命令：/reset 清空历史；/quit 或 Ctrl+D 退出。
 """
@@ -137,13 +113,21 @@ def _gen_reply(
     return "".join(parts).strip()
 
 
-def main() -> None:
+def main(default_profile: str = "base_chat") -> None:
     ap = argparse.ArgumentParser(
-        description="chat_finetune：终端交互，本地 HF 模型（可选 LoRA）。路径须显式传入。",
+        description=f"chat_finetune：终端交互，默认自动读取 config.json 的 {default_profile}。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=_epilog(),
+        epilog=_epilog(default_profile, Path(sys.argv[0]).name),
     )
-    ap.add_argument("--model", type=Path, required=True, metavar="DIR", help="基座模型目录（必填）")
+    ap.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="指定 JSON 配置文件；不指定时读取脚本同目录的 config.json",
+    )
+    ap.add_argument("--profile", type=str, default=None, metavar="NAME", help=argparse.SUPPRESS)
+    ap.add_argument("--model", type=Path, default=None, metavar="DIR", help="基座模型目录")
     ap.add_argument("--lora", type=Path, default=None, metavar="DIR", help="LoRA 适配器目录；省略则只加载基座")
     ap.add_argument(
         "--system",
@@ -155,36 +139,63 @@ def main() -> None:
     ap.add_argument(
         "--device",
         choices=("auto", "cuda", "mps", "cpu"),
-        required=True,
+        default=None,
         metavar="NAME",
-        help="计算设备：auto / cuda / mps / cpu（须显式指定；auto 按环境自动选）",
+        help="计算设备：auto / cuda / mps / cpu（auto 按环境自动选）",
     )
     ap.add_argument(
         "--thinking",
         choices=("on", "off"),
-        required=True,
+        default=None,
         metavar="on|off",
         help="思考模式：on=模板启用 enable_thinking（先推理块再答）；off=不启用（直接答）",
     )
-    ap.add_argument("--max-new-tokens", type=int, required=True, metavar="N", help="每轮最多生成多少个新 token（须显式指定）")
+    ap.add_argument("--max-new-tokens", type=int, default=None, metavar="N", help="每轮最多生成多少个新 token")
     ap.add_argument(
         "--temperature",
         type=float,
-        required=True,
+        default=None,
         metavar="FLOAT",
         help="采样温度；>0 且未加 --greedy 时启用采样。加 --greedy 时忽略此项",
     )
-    ap.add_argument("--top-p", type=float, required=True, metavar="FLOAT", help="nucleus 采样 top_p；贪心时可填 1")
-    ap.add_argument("--greedy", action="store_true", help="贪心解码（关闭采样）")
-    ap.add_argument("--no-stream", action="store_true", help="关闭流式输出，整段生成后再打印")
-    ap.add_argument("--4bit", dest="use_4bit", action="store_true", help="仅 CUDA：4bit 加载基座（需 bitsandbytes）")
+    ap.add_argument("--top-p", type=float, default=None, metavar="FLOAT", help="nucleus 采样 top_p；贪心时可填 1")
+    ap.add_argument("--greedy", action="store_true", default=None, help="贪心解码（关闭采样）")
+    ap.add_argument("--no-stream", action="store_true", default=None, help="关闭流式输出，整段生成后再打印")
+    ap.add_argument("--4bit", dest="use_4bit", action="store_true", default=None, help="仅 CUDA：4bit 加载基座（需 bitsandbytes）")
 
     args = ap.parse_args()
+    try:
+        profile_config, config_base_dir, config_file = load_profile(
+            args.config,
+            args.profile or default_profile,
+            default_config=str(Path(__file__).with_name("config.json")),
+        )
+    except ValueError as e:
+        _die(f"错误：读取配置失败：{e}")
+    args = apply_config(args, profile_config)
 
-    model_path = args.model.expanduser().resolve()
+    for name, hint in (
+        ("model", "--model 或配置中的 model"),
+        ("device", "--device 或配置中的 device"),
+        ("thinking", "--thinking 或配置中的 thinking"),
+        ("max_new_tokens", "--max-new-tokens 或配置中的 max_new_tokens"),
+        ("temperature", "--temperature 或配置中的 temperature"),
+        ("top_p", "--top-p 或配置中的 top_p"),
+    ):
+        if getattr(args, name) is None:
+            _die(f"错误：缺少 {hint}")
+    if args.greedy is None:
+        args.greedy = False
+    if args.no_stream is None:
+        args.no_stream = False
+    if args.use_4bit is None:
+        args.use_4bit = False
+
+    model_path = resolve_path(args.model, base_dir=config_base_dir)
+    assert model_path is not None
     _require_hf_dir(model_path, label="--model")
 
-    lora_path = args.lora.expanduser().resolve() if args.lora is not None else None
+    lora_path = resolve_path(args.lora, base_dir=config_base_dir)
     if lora_path is not None:
         if not lora_path.is_dir():
             _die(f"错误：--lora 不是目录：\n  {lora_path}")
@@ -193,6 +204,13 @@ def main() -> None:
                 f"错误：LoRA 目录中缺少 adapter_config.json：\n  {lora_path}\n"
                 "请确认该目录含 adapter_model.safetensors 等训练输出。"
             )
+
+    print("运行配置：", file=sys.stderr)
+    print(f"  配置文件: {config_file if config_file is not None else '未使用'}", file=sys.stderr)
+    print(f"  配置 profile: {args.profile or default_profile}", file=sys.stderr)
+    print(f"  基座模型: {model_path}", file=sys.stderr)
+    print(f"  微调文件: {lora_path if lora_path is not None else '未使用'}", file=sys.stderr)
+    print("  输出目录: 不适用", file=sys.stderr)
 
     device = _resolve_device(args.device)
     dtype = _pick_dtype(device)

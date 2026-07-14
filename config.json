@@ -1,0 +1,35 @@
+{
+  "paths": {
+    "model": "../../../../Projects/LLMs/models/Qwen3.5-9B",
+    "data": "./data/train_cute.jsonl",
+    "lora_output": "../../../../Projects/LLMs/outputs/Qwen3.5-9B"
+  },
+  "defaults": {
+    "model": "${paths.model}",
+    "device": "auto",
+    "thinking": "off",
+    "max_new_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "greedy": false,
+    "no_stream": false,
+    "use_4bit": false
+  },
+  "profiles": {
+    "base_chat": {},
+    "finetune": {
+      "data": "${paths.data}",
+      "output": "${paths.lora_output}",
+      "epochs": 3,
+      "learning_rate": 0.0001,
+      "batch": 1,
+      "grad_accum": 8,
+      "max_seq_len": 2048,
+      "lora_r": 16,
+      "lora_alpha": 32
+    },
+    "lora_chat": {
+      "lora": "${paths.lora_output}"
+    }
+  }
+}
